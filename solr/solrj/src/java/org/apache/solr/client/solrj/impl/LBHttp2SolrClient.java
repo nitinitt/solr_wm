@@ -17,6 +17,7 @@
 package org.apache.solr.client.solrj.impl;
 
 import java.util.Arrays;
+import java.util.concurrent.ExecutorService;
 
 import org.apache.solr.client.solrj.SolrClient;
 
@@ -62,6 +63,15 @@ public class LBHttp2SolrClient extends LBSolrClient {
     super(Arrays.asList(baseSolrUrls));
     this.httpClient = httpClient;
   }
+
+  public LBHttp2SolrClient(Http2SolrClient httpClient, boolean enableSpeculativeRetry, ExecutorService executorService, String... baseSolrUrls) {
+    super(Arrays.asList(baseSolrUrls));
+    this.httpClient = httpClient;
+    this.enableSpeculativeRetry = enableSpeculativeRetry;
+    this.executorService = executorService;
+  }
+
+
   @Override
   protected SolrClient getClient(String baseUrl) {
     return httpClient;

@@ -104,6 +104,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
   int   permittedLoadBalancerRequestsMinimumAbsolute = 0;
   float permittedLoadBalancerRequestsMaximumFraction = 1.0f;
   boolean accessPolicy = false;
+  boolean enableSpeculativeExecution = false;
   private WhitelistHostChecker whitelistHostChecker = null;
 
   private String scheme = null;
@@ -137,6 +138,8 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
 
   // Configure if the threadpool favours fairness over throughput
   static final String INIT_FAIRNESS_POLICY = "fairnessPolicy";
+
+  static final String ENABLE_SPECULATIVE_EXECUTION = "enableSpeculativeExecution";
 
   public static final String INIT_SHARDS_WHITELIST = "shardsWhitelist";
 
@@ -281,6 +284,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
         permittedLoadBalancerRequestsMaximumFraction,
         sb);
     this.accessPolicy = getParameter(args, INIT_FAIRNESS_POLICY, accessPolicy,sb);
+    this.enableSpeculativeExecution = getParameter(args, ENABLE_SPECULATIVE_EXECUTION, enableSpeculativeExecution, sb);
     this.whitelistHostChecker = new WhitelistHostChecker(args == null? null: (String) args.get(INIT_SHARDS_WHITELIST), !getDisableShardsWhitelist());
     log.info("Host whitelist initialized: {}", this.whitelistHostChecker);
 
@@ -318,8 +322,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
         .idleTimeout(soTimeout)
         .maxConnectionsPerHost(maxConnectionsPerHost).build();
     this.defaultClient.addListenerFactory(this.httpListenerFactory);
-    this.loadbalancer = new LBHttp2SolrClient(defaultClient);
-
+    this.loadbalancer = new LBHttp2SolrClient(defaultClient, enableSpeculativeExecution, this.commExecutor);
     initReplicaListTransformers(getParameter(args, "replicaRouting", null, sb));
 
     log.debug("created with {}",sb);

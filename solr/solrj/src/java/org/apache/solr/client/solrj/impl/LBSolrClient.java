@@ -32,8 +32,11 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -85,7 +88,9 @@ public abstract class LBSolrClient extends SolrClient {
   protected volatile RequestWriter requestWriter;
 
   protected Set<String> queryParams = new HashSet<>();
-
+  protected boolean enableSpeculativeRetry = false;
+  private RetryStrategy retryStrategy = new DefaultRetry();
+  protected ExecutorService executorService;
   static {
     solrQuery.setRows(0);
     /**
@@ -201,6 +206,10 @@ public abstract class LBSolrClient extends SolrClient {
       }
       updateAliveList();
     }
+
+    if (enableSpeculativeRetry) {
+      retryStrategy = new SpeculativeRetry();
+    }
   }
 
   protected void updateAliveList() {
@@ -256,7 +265,10 @@ public abstract class LBSolrClient extends SolrClient {
     Rsp rsp = new Rsp();
     Exception ex = null;
     boolean isNonRetryable = req.request instanceof IsUpdateRequest || ADMIN_PATHS.contains(req.request.getPath());
-    List<ServerWrapper> skipped = null;
+    final List<ServerWrapper> skipped = new ArrayList<>();
+    final List<String> goodServers = new ArrayList<>();
+
+    getZombieServers(req, goodServers, skipped);
 
     final Integer numServersToTry = req.getNumServersToTry();
     int numServersTried = 0;
@@ -264,37 +276,22 @@ public abstract class LBSolrClient extends SolrClient {
     boolean timeAllowedExceeded = false;
     long timeAllowedNano = getTimeAllowedInNanos(req.getRequest());
     long timeOutTime = System.nanoTime() + timeAllowedNano;
-    for (String serverStr : req.getServers()) {
+    int i = 0;
+    while (i < goodServers.size()) {
       if (timeAllowedExceeded = isTimeExceeded(timeAllowedNano, timeOutTime)) {
         break;
       }
-
-      serverStr = normalize(serverStr);
-      // if the server is currently a zombie, just skip to the next one
-      ServerWrapper wrapper = zombieServers.get(serverStr);
-      if (wrapper != null) {
-        // System.out.println("ZOMBIE SERVER QUERIED: " + serverStr);
-        final int numDeadServersToTry = req.getNumDeadServersToTry();
-        if (numDeadServersToTry > 0) {
-          if (skipped == null) {
-            skipped = new ArrayList<>(numDeadServersToTry);
-            skipped.add(wrapper);
-          }
-          else if (skipped.size() < numDeadServersToTry) {
-            skipped.add(wrapper);
-          }
-        }
-        continue;
-      }
       try {
-        MDC.put("LBSolrClient.url", serverStr);
+        MDC.put("LBSolrClient.url", goodServers.get(i));
 
         if (numServersToTry != null && numServersTried > numServersToTry.intValue()) {
           break;
         }
 
-        ++numServersTried;
-        ex = doRequest(serverStr, req, rsp, isNonRetryable, false);
+        numServersTried += retryStrategy.getCount();
+        ex = retryStrategy.execute(req, rsp, isNonRetryable, false, goodServers, i);
+        i += retryStrategy.getCount();
+
         if (ex == null) {
           return rsp; // SUCCESS
         }
@@ -344,6 +341,73 @@ public abstract class LBSolrClient extends SolrClient {
       throw new SolrServerException(solrServerExceptionMessage);
     } else {
       throw new SolrServerException(solrServerExceptionMessage+":" + zombieServers.keySet(), ex);
+    }
+  }
+
+  public class DefaultRetry implements RetryStrategy {
+    @Override
+    public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException {
+      return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
+    }
+
+    @Override
+    public int getCount() {
+      return 1;
+    }
+  }
+
+  public class SpeculativeRetry implements RetryStrategy {
+    @Override
+    public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException {
+      CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
+        try {
+          return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
+        } catch (SolrServerException e) {
+          throw new RuntimeException(e);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }), executorService);
+
+      CompletableFuture<Exception> future2 = CompletableFuture.supplyAsync((() -> {
+        try {
+          Thread.sleep(getTimeAllowedInNanos(req.getRequest()) / 2);
+        } catch (InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+
+        try {
+          return doRequest(servers.get(index + 1), req, rsp, isNonRetryable, isZombie);
+        } catch (SolrServerException e) {
+          throw new RuntimeException(e);
+        } catch (IOException e) {
+          throw new RuntimeException(e);
+        }
+      }), executorService);
+
+      return CompletableFuture.anyOf(future1, future2).get();
+    }
+
+    @Override
+    public int getCount() {
+      return 2;
+    }
+  }
+
+  private void getZombieServers(Req req, List<String> goodServers, List<ServerWrapper> zombieInCurrentReq) {
+
+    for (String serverStr : req.getServers()) {
+//      if (timeAllowedExceeded = isTimeExceeded(timeAllowedNano, timeOutTime)) {
+//        break;
+//      }
+      serverStr = normalize(serverStr);
+      // if the server is currently a zombie, just skip to the next one
+      ServerWrapper wrapper = zombieServers.get(serverStr);
+      if (wrapper == null) {
+        goodServers.add(serverStr);
+      } else if (req.getNumDeadServersToTry() > 0 && zombieInCurrentReq.size() < req.getNumDeadServersToTry()) {
+        zombieInCurrentReq.add(wrapper);
+      }
     }
   }
 
