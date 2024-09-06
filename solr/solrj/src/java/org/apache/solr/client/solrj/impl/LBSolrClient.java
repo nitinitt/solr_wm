@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -359,33 +360,52 @@ public abstract class LBSolrClient extends SolrClient {
   public class SpeculativeRetry implements RetryStrategy {
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException {
-      CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
-        try {
-          return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
-        } catch (SolrServerException e) {
-          throw new RuntimeException(e);
-        } catch (IOException e) {
-          throw new RuntimeException(e);
-        }
-      }), executorService);
+      if ((index + 1) < servers.size()) {
+        CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
+          try {
+            return doRequest(servers.get(index), req, new LBSolrClient.Rsp(), isNonRetryable, isZombie);
+          } catch (SolrServerException | IOException e) {
+            throw new RuntimeException(e);
+          }
+        }), executorService);
 
-      CompletableFuture<Exception> future2 = CompletableFuture.supplyAsync((() -> {
-        try {
-          Thread.sleep(getTimeAllowedInNanos(req.getRequest()) / 2);
-        } catch (InterruptedException e) {
-          throw new RuntimeException(e);
-        }
+        CompletableFuture<Exception> future2 = CompletableFuture.supplyAsync((() -> {
+          try {
+            Thread.sleep(getTimeAllowedInNanos(req.getRequest()) / 2);
+          } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+          }
 
-        try {
-          return doRequest(servers.get(index + 1), req, rsp, isNonRetryable, isZombie);
-        } catch (SolrServerException e) {
-          throw new RuntimeException(e);
-        } catch (IOException e) {
-          throw new RuntimeException(e);
-        }
-      }), executorService);
+          try {
+            return doRequest(servers.get(index + 1), req, new LBSolrClient.Rsp(), isNonRetryable, isZombie);
+          } catch (SolrServerException | IOException e) {
+            throw new RuntimeException(e);
+          }
+        }), executorService);
 
-      return CompletableFuture.anyOf(future1, future2).get();
+        CompletableFuture<Object> combinedFuture = CompletableFuture.anyOf(future1, future2);
+        //TODO: Put a timeout with timeAllowed param
+        try {
+          return (Exception) combinedFuture.get();
+        } catch (InterruptedException | ExecutionException e) {
+          if (future1.isDone() && future1.isCompletedExceptionally()) {
+            try {
+              return future2.get();
+            } catch (InterruptedException | ExecutionException ex) {
+              throw new SolrServerException(ex);
+            }
+          } else {
+            try {
+              return future1.get();
+            } catch (InterruptedException | ExecutionException ex) {
+              throw new SolrServerException(ex);
+            }
+          }
+        }
+      } else {
+        // Reached last server, cannot fire 2 requests
+        return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
+      }
     }
 
     @Override
