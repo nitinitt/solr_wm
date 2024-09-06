@@ -387,24 +387,28 @@ public abstract class LBSolrClient extends SolrClient {
         //TODO: Put a timeout with timeAllowed param
         try {
           return (Exception) combinedFuture.get();
-        } catch (InterruptedException | ExecutionException e) {
+        } catch (InterruptedException interruptedException) {
+          // We passed the time and no reply was heard, both nodes slow move on to next set by returning exception
+          return interruptedException;
+        } catch (ExecutionException executionException) {
+          // For simplicity: Irrespective of error code received, we move to next tuple
           if (future1.isDone() && future1.isCompletedExceptionally()) {
-            try {
-              return future2.get();
-            } catch (InterruptedException | ExecutionException ex) {
-              throw new SolrServerException(ex);
-            }
+            return waitForSecondExecution(future2);
           } else {
-            try {
-              return future1.get();
-            } catch (InterruptedException | ExecutionException ex) {
-              throw new SolrServerException(ex);
-            }
+            return waitForSecondExecution(future1);
           }
         }
       } else {
         // Reached last server, cannot fire 2 requests
         return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
+      }
+    }
+
+    private Exception waitForSecondExecution(CompletableFuture<Exception> future) {
+      try {
+        return future.get();
+      } catch (InterruptedException | ExecutionException ex) {
+        return ex;
       }
     }
 
