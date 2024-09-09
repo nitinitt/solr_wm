@@ -36,9 +36,12 @@ import org.apache.solr.common.util.NamedList;
 import org.apache.solr.request.SolrRequestInfo;
 import org.apache.solr.util.tracing.GlobalTracer;
 import org.apache.solr.util.tracing.SolrRequestCarrier;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 class ShardRequestor implements Callable<ShardResponse> {
+  private static final Logger log = LoggerFactory.getLogger(ShardRequestor.class);
   private final ShardRequest sreq;
   private final String shard;
   private final ModifiableSolrParams params;
@@ -127,6 +130,7 @@ class ShardRequestor implements Callable<ShardResponse> {
       if (urls.size() <= 1) {
         String url = urls.get(0);
         srsp.setShardAddress(url);
+        log.info("shard handler request start");
         ssr.nl = httpShardHandler.request(url, req);
       } else {
         LBSolrClient.Rsp rsp = httpShardHandler.httpShardHandlerFactory.makeLoadBalancedRequest(req, urls);

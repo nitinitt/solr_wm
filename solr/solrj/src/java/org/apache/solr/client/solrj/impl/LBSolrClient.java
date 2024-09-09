@@ -18,6 +18,7 @@
 package org.apache.solr.client.solrj.impl;
 
 import java.io.IOException;
+import java.lang.invoke.MethodHandles;
 import java.lang.ref.WeakReference;
 import java.net.ConnectException;
 import java.net.MalformedURLException;
@@ -40,6 +41,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.solr.client.solrj.ResponseParser;
@@ -57,11 +59,14 @@ import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.ExecutorUtil;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SolrNamedThreadFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import static org.apache.solr.common.params.CommonParams.ADMIN_PATHS;
 
 public abstract class LBSolrClient extends SolrClient {
+  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
 
   // defaults
   private static final Set<Integer> RETRY_CODES = new HashSet<>(Arrays.asList(404, 403, 503, 500));
@@ -89,9 +94,10 @@ public abstract class LBSolrClient extends SolrClient {
   protected volatile RequestWriter requestWriter;
 
   protected Set<String> queryParams = new HashSet<>();
-  protected boolean enableSpeculativeRetry = false;
+  protected boolean enableSpeculativeRetry = true;
   private RetryStrategy retryStrategy = new DefaultRetry();
   protected ExecutorService executorService;
+  private int defExecutionTimeSpecRetryInMs = 2000;
   static {
     solrQuery.setRows(0);
     /**
@@ -209,6 +215,7 @@ public abstract class LBSolrClient extends SolrClient {
     }
 
     if (enableSpeculativeRetry) {
+      log.warn("Speculative retry enabled");
       retryStrategy = new SpeculativeRetry();
     }
   }
@@ -289,9 +296,8 @@ public abstract class LBSolrClient extends SolrClient {
           break;
         }
 
-        numServersTried += retryStrategy.getCount();
         ex = retryStrategy.execute(req, rsp, isNonRetryable, false, goodServers, i);
-        i += retryStrategy.getCount();
+        numServersTried += retryStrategy.getCount(goodServers, i);
 
         if (ex == null) {
           return rsp; // SUCCESS
@@ -352,7 +358,7 @@ public abstract class LBSolrClient extends SolrClient {
     }
 
     @Override
-    public int getCount() {
+    public int getCount(List<String> servers, int index) {
       return 1;
     }
   }
@@ -360,9 +366,14 @@ public abstract class LBSolrClient extends SolrClient {
   public class SpeculativeRetry implements RetryStrategy {
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException {
+      log.info("fire speculative execution");
+      final long startTimeInMs = System.currentTimeMillis();
+      final long timeAllowedMs = req.getRequest().getParams().getInt(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
+
       if ((index + 1) < servers.size()) {
         CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
           try {
+            log.info("Firing request on: {}", servers.get(index));
             return doRequest(servers.get(index), req, new LBSolrClient.Rsp(), isNonRetryable, isZombie);
           } catch (SolrServerException | IOException e) {
             throw new RuntimeException(e);
@@ -370,32 +381,39 @@ public abstract class LBSolrClient extends SolrClient {
         }), executorService);
 
         CompletableFuture<Exception> future2 = CompletableFuture.supplyAsync((() -> {
-          try {
-            Thread.sleep(getTimeAllowedInNanos(req.getRequest()) / 2);
-          } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-          }
+//          try {
+//            Thread.sleep(timeAllowedMs / 2);
+//          } catch (InterruptedException e) {
+//            throw new RuntimeException(e);
+//          }
 
           try {
+            log.warn("Firing request on: {}", servers.get(index + 1));
             return doRequest(servers.get(index + 1), req, new LBSolrClient.Rsp(), isNonRetryable, isZombie);
           } catch (SolrServerException | IOException e) {
             throw new RuntimeException(e);
           }
         }), executorService);
 
+
         CompletableFuture<Object> combinedFuture = CompletableFuture.anyOf(future1, future2);
-        //TODO: Put a timeout with timeAllowed param
         try {
-          return (Exception) combinedFuture.get();
-        } catch (InterruptedException interruptedException) {
+          return (Exception) combinedFuture.get(timeAllowedMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException | TimeoutException ex) {
           // We passed the time and no reply was heard, both nodes slow move on to next set by returning exception
-          return interruptedException;
+          return ex;
         } catch (ExecutionException executionException) {
-          // For simplicity: Irrespective of error code received, we move to next tuple
-          if (future1.isDone() && future1.isCompletedExceptionally()) {
-            return waitForSecondExecution(future2);
+          long remainingTimeMs = timeAllowedMs - (System.currentTimeMillis() - startTimeInMs);
+          if (remainingTimeMs > 0) {
+            // In case SolrServerException OR IOException was issued, we raise it to caller as is. Not changing the default behaviour of retry here
+            if (future1.isDone() && future1.isCompletedExceptionally()) {
+              return waitForSecondExecution(future2, remainingTimeMs);
+            } else {
+              return waitForSecondExecution(future1, remainingTimeMs);
+            }
           } else {
-            return waitForSecondExecution(future1);
+            // Time remaining is non zero, enter back in for loop
+            return new SolrServerException("Request time execeeded");
           }
         }
       } else {
@@ -404,22 +422,36 @@ public abstract class LBSolrClient extends SolrClient {
       }
     }
 
-    private Exception waitForSecondExecution(CompletableFuture<Exception> future) {
+    private Exception waitForSecondExecution(CompletableFuture<Exception> future, long remainingTimeMs) throws SolrServerException, IOException {
       try {
-        return future.get();
-      } catch (InterruptedException | ExecutionException ex) {
+        return future.get(remainingTimeMs, TimeUnit.MILLISECONDS);
+      } catch (InterruptedException | TimeoutException ex) {
         return ex;
+      } catch (ExecutionException executionException) {
+        if (executionException.getCause() != null) {
+          if (executionException.getCause() instanceof IOException) {
+            throw (IOException) executionException.getCause();
+          } else if (executionException.getCause() instanceof InterruptedException) {
+            return (InterruptedException)executionException.getCause();
+          } else if (executionException.getCause() instanceof SolrServerException) {
+            throw (SolrServerException) executionException.getCause();
+          }
+        }
+        throw new SolrServerException(executionException);
       }
     }
 
     @Override
-    public int getCount() {
-      return 2;
+    public int getCount(List<String> servers, int index) {
+      if (index + 1 < servers.size()) {
+        return 2;
+      } else {
+        return 1;
+      }
     }
   }
 
   private void getZombieServers(Req req, List<String> goodServers, List<ServerWrapper> zombieInCurrentReq) {
-
     for (String serverStr : req.getServers()) {
 //      if (timeAllowedExceeded = isTimeExceeded(timeAllowedNano, timeOutTime)) {
 //        break;

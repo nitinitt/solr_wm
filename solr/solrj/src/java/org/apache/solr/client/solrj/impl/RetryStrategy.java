@@ -24,5 +24,5 @@ import java.util.List;
 public interface RetryStrategy {
     Exception execute(LBSolrClient.Req req, LBSolrClient.Rsp rsp, boolean isNonRetryable,
                         boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException;
-    int getCount();
+    public int getCount(List<String> servers, int index);
 }
