@@ -20,9 +20,9 @@ package org.apache.solr.client.solrj.impl;
 import org.apache.solr.client.solrj.SolrServerException;
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public interface RetryStrategy {
     Exception execute(LBSolrClient.Req req, LBSolrClient.Rsp rsp, boolean isNonRetryable,
-                        boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException;
-    int getCount(List<String> servers, int index);
+                      boolean isZombie, List<String> servers, int index, AtomicInteger serverTried) throws SolrServerException, IOException;
 }
