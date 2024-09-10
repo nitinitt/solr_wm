@@ -96,7 +96,7 @@ public abstract class LBSolrClient extends SolrClient {
   protected boolean enableSpeculativeRetry = true;
   private RetryStrategy retryStrategy = new DefaultRetry();
   protected ExecutorService executorService;
-  private int defExecutionTimeSpecRetryInMs = 2000;
+  private int defExecutionTimeSpecRetryInMs = 5000;
   static {
     solrQuery.setRows(0);
     /**
@@ -364,16 +364,16 @@ public abstract class LBSolrClient extends SolrClient {
   }
 
   public class SpeculativeRetry implements RetryStrategy {
+    //TODO: Better to return an object of class with Exception and servers tried count
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index) throws SolrServerException, IOException {
-      log.info("===========fire speculative execution");
       final long startTimeInMs = System.currentTimeMillis();
       final long timeAllowedMs = req.getRequest().getParams().getInt(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
       final Rsp rsp1 = new LBSolrClient.Rsp();
       if ((index + 1) < servers.size()) {
         CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
           try {
-            log.info("===========Firing original request on: {}", servers.get(index));
+            log.info("===========Firing request on: {}", servers.get(index));
             return doRequest(servers.get(index), req, rsp1, isNonRetryable, isZombie);
           } catch (SolrServerException | IOException e) {
             return e;
@@ -388,8 +388,18 @@ public abstract class LBSolrClient extends SolrClient {
             return e;
           }
           try {
-            log.warn("===========Slept for: {}ms before firing request on: {}", (timeAllowedMs / 2), servers.get(index + 1));
-            return doRequest(servers.get(index + 1), req, rsp2, isNonRetryable, isZombie);
+            try {
+              //This is an optimization to not fire 2 queries
+              if (future1.isDone() && !future1.isCompletedExceptionally() && future1.get() == null) {
+                log.info("===========Slept for: {}ms, cancelling speculative firing on another server: {}", (timeAllowedMs / 2), servers.get(index + 1));
+                return null;
+              } else {
+                log.info("===========Slept for: {}ms before firing request on: {}", (timeAllowedMs / 2), servers.get(index + 1));
+                return doRequest(servers.get(index + 1), req, rsp2, isNonRetryable, isZombie);
+              }
+            } catch (InterruptedException | ExecutionException e) {
+              return doRequest(servers.get(index + 1), req, rsp2, isNonRetryable, isZombie);
+            }
           } catch (SolrServerException | IOException e) {
             return e;
           }
@@ -397,19 +407,21 @@ public abstract class LBSolrClient extends SolrClient {
 
         CompletableFuture<Object> combinedFuture = CompletableFuture.anyOf(future1, future2);
         try {
-          Exception ex = (Exception) combinedFuture.get(timeAllowedMs, TimeUnit.MILLISECONDS);
+          Exception exAny = (Exception) combinedFuture.get(timeAllowedMs, TimeUnit.MILLISECONDS);
           if (future1.isDone()) {
-            if (ex == null) {
+            if (exAny == null) {
               log.info("===========Result is obtained from: {}", rsp1.server);
               rsp.rsp = rsp1.rsp;
               rsp.server = rsp1.server;
+              // Cancelling future as an optimization, to make sure we are not firing unnecessary queries
               return null;
             } else {
               final long timeRemainingInMs = System.currentTimeMillis() - startTimeInMs;
               //TODO: Fix time remaining if needed
+              //TODO: Metrics here for speculative execution
               Exception ex2 = future2.get(timeRemainingInMs, TimeUnit.MILLISECONDS);
               if (ex2 == null) {
-                log.info("===========Result is obtained: {}", rsp2.server);
+                log.info("===========Result is obtained from speculative execution: {}", rsp2.server);
                 rsp.rsp = rsp2.rsp;
                 rsp.server = rsp2.server;
               } else if (ex2 instanceof IOException) {
@@ -420,27 +432,31 @@ public abstract class LBSolrClient extends SolrClient {
               return ex2;
             }
           }
-          //Atleast 1 future is complete, 1st if check failed
-          if (future2.isDone() && ex == null) {
-              log.info("===========Result is obtained: {}", rsp2.server);
+
+          if (future2.isDone()) {
+            if (exAny == null) {
+              //TODO: Metrics here for speculative execution
+              log.info("===========Result is obtained from speculative execution: {}", rsp2.server);
               rsp.rsp = rsp2.rsp;
               rsp.server = rsp2.server;
               return null;
-          } else {
-            final long timeRemainingInMs = System.currentTimeMillis() - startTimeInMs;
-            //TODO: Fix time remaining if needed
-            Exception ex1 = future1.get(timeRemainingInMs, TimeUnit.MILLISECONDS);
-            if (ex1 == null) {
-              log.info("===========Result is obtained from server1: {}", rsp1.server);
-              rsp.rsp = rsp1.rsp;
-              rsp.server = rsp1.server;
-            } else if (ex1 instanceof IOException) {
-              throw (IOException) ex1;
-            } else if (ex1 instanceof SolrServerException) {
-              throw (SolrServerException) ex1;
+            } else {
+              final long timeRemainingInMs = System.currentTimeMillis() - startTimeInMs;
+              //TODO: Fix time remaining if needed
+              Exception ex1 = future1.get(timeRemainingInMs, TimeUnit.MILLISECONDS);
+              if (ex1 == null) {
+                log.info("===========Result is obtained from server1: {}", rsp1.server);
+                rsp.rsp = rsp1.rsp;
+                rsp.server = rsp1.server;
+              } else if (ex1 instanceof IOException) {
+                throw (IOException) ex1;
+              } else if (ex1 instanceof SolrServerException) {
+                throw (SolrServerException) ex1;
+              }
+              return ex1;
             }
-            return ex1;
           }
+          return exAny;
         } catch (InterruptedException | TimeoutException | ExecutionException ex) {
           //TODO: handle Execution exception for cases where thread was not launched for Server 1 but gets launched for Server 2
           return ex;
