@@ -53,6 +53,8 @@ import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.ExecutorUtil;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SolrNamedThreadFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import static org.apache.solr.common.params.CommonParams.ADMIN_PATHS;
@@ -63,6 +65,7 @@ public abstract class LBSolrClient extends SolrClient {
   private static final Set<Integer> RETRY_CODES = new HashSet<>(Arrays.asList(404, 403, 503, 500));
   private static final int CHECK_INTERVAL = 60 * 1000; //1 minute between checks
   private static final int NONSTANDARD_PING_LIMIT = 5;  // number of times we'll ping dead servers not in the server list
+  private static final Logger log = LoggerFactory.getLogger(LBSolrClient.class);
 
   // keys to the maps are currently of the form "http://localhost:8983/solr"
   // which should be equivalent to HttpSolrServer.getBaseURL()
@@ -294,6 +297,7 @@ public abstract class LBSolrClient extends SolrClient {
         }
 
         ++numServersTried;
+
         ex = doRequest(serverStr, req, rsp, isNonRetryable, false);
         if (ex == null) {
           return rsp; // SUCCESS
@@ -367,6 +371,15 @@ public abstract class LBSolrClient extends SolrClient {
       rsp.server = baseUrl;
       req.getRequest().setBasePath(baseUrl);
       rsp.rsp = getClient(baseUrl).request(req.getRequest(), (String) null);
+      if (baseUrl.contains("n1")) {
+        Thread.sleep(30000);
+        log.warn("====Sleep for 30sec to simulate slow replica for: {}", baseUrl);
+        isNonRetryable = false;
+        throw new SocketException("Expected exception");
+      } else {
+        log.warn("====Executing request on: {}", baseUrl);
+      }
+
       if (isZombie) {
         zombieServers.remove(baseUrl);
       }

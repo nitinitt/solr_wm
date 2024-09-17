@@ -570,6 +570,9 @@ public class HttpSolrClient extends BaseHttpSolrClient {
       }
       final HttpResponse response = httpClient.execute(method, httpClientRequestContext);
 
+
+
+
       int httpStatus = response.getStatusLine().getStatusCode();
       
       // Read the contents
