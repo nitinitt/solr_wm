@@ -373,7 +373,7 @@ public abstract class LBSolrClient extends SolrClient {
       rsp.rsp = getClient(baseUrl).request(req.getRequest(), (String) null);
       if (baseUrl.contains("n1")) {
         Thread.sleep(30000);
-        log.warn("====Sleep for 30sec to simulate slow replica for: {}", baseUrl);
+        log.warn("====Sleep completed for 30sec to simulate slow replica for: {}", baseUrl);
         isNonRetryable = false;
         throw new SocketException("Expected exception");
       } else {
