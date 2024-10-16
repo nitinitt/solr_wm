@@ -323,7 +323,7 @@ public class HttpShardHandlerFactory extends ShardHandlerFactory implements org.
         .idleTimeout(soTimeout)
         .maxConnectionsPerHost(maxConnectionsPerHost).build();
     this.defaultClient.addListenerFactory(this.httpListenerFactory);
-    //TODO: This wiring needs to be corrected
+
     this.loadbalancer = new LBHttp2SolrClient(defaultClient, enableSpeculativeExecution, this.commExecutor);
     initReplicaListTransformers(getParameter(args, "replicaRouting", null, sb));
 

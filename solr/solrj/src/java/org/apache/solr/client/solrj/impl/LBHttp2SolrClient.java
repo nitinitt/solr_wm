@@ -65,12 +65,9 @@ public class LBHttp2SolrClient extends LBSolrClient {
   }
 
   public LBHttp2SolrClient(Http2SolrClient httpClient, boolean enableSpeculativeRetry, ExecutorService executorService, String... baseSolrUrls) {
-    super(Arrays.asList(baseSolrUrls));
+    super(enableSpeculativeRetry, executorService, Arrays.asList(baseSolrUrls));
     this.httpClient = httpClient;
-    this.enableSpeculativeRetry = enableSpeculativeRetry;
-    this.executorService = executorService;
   }
-
 
   @Override
   protected SolrClient getClient(String baseUrl) {

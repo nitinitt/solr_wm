@@ -93,8 +93,8 @@ public abstract class LBSolrClient extends SolrClient {
   protected volatile RequestWriter requestWriter;
 
   protected Set<String> queryParams = new HashSet<>();
-  protected boolean enableSpeculativeRetry = true;
-  private RetryStrategy retryStrategy = new DefaultRetry();
+  protected boolean enableSpeculativeRetry = false;
+  protected RetryStrategy retryStrategy = new DefaultRetry();
   protected ExecutorService executorService;
   private int defExecutionTimeSpecRetryInMs = 5000;
   static {
@@ -205,6 +205,10 @@ public abstract class LBSolrClient extends SolrClient {
   }
 
   public LBSolrClient(List<String> baseSolrUrls) {
+    initAliveServers(baseSolrUrls);
+  }
+
+  private void initAliveServers(List<String> baseSolrUrls) {
     if (!baseSolrUrls.isEmpty()) {
       for (String s : baseSolrUrls) {
         ServerWrapper wrapper = createServerWrapper(s);
@@ -212,9 +216,15 @@ public abstract class LBSolrClient extends SolrClient {
       }
       updateAliveList();
     }
+  }
+
+  public LBSolrClient(final boolean enableSpeculativeRetry, final ExecutorService executorService, List<String> baseSolrUrls) {
+    initAliveServers(baseSolrUrls);
 
     if (enableSpeculativeRetry) {
-      log.warn("Speculative retry enabled");
+      this.enableSpeculativeRetry = true;
+      this.executorService = executorService;
+      log.info("Speculative retry enabled");
       retryStrategy = new SpeculativeRetry();
     }
   }
@@ -271,6 +281,7 @@ public abstract class LBSolrClient extends SolrClient {
   public Rsp request(Req req) throws SolrServerException, IOException {
     Rsp rsp = new Rsp();
     Exception ex = null;
+    log.info("Request========");
     boolean isNonRetryable = req.request instanceof IsUpdateRequest || ADMIN_PATHS.contains(req.request.getPath());
     final List<ServerWrapper> skipped = new ArrayList<>();
     final List<String> goodServers = new ArrayList<>();
@@ -355,6 +366,8 @@ public abstract class LBSolrClient extends SolrClient {
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index, AtomicInteger serverTried) throws SolrServerException, IOException {
       serverTried.addAndGet(1);
+      log.info("Spex disabled: {}", servers.get(index));
+
       return doRequest(servers.get(index), req, rsp, isNonRetryable, isZombie);
     }
   }
@@ -363,7 +376,7 @@ public abstract class LBSolrClient extends SolrClient {
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index, AtomicInteger serversTried) throws SolrServerException, IOException {
       final long startTimeInMs = System.currentTimeMillis();
-      final long timeAllowedMs = req.getRequest().getParams().getInt(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
+      final long timeAllowedMs = req.getRequest().getParams() == null? defExecutionTimeSpecRetryInMs: req.getRequest().getParams().getLong(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
       final Rsp rsp1 = new LBSolrClient.Rsp();
       if ((index + 1) < servers.size()) {
         CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
