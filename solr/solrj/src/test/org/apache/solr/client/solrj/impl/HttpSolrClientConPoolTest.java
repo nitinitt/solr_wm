@@ -27,17 +27,13 @@ import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.apache.http.pool.PoolStats;
 import org.apache.solr.SolrJettyTestBase;
-import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrServerException;
 import org.apache.solr.client.solrj.embedded.JettySolrRunner;
-import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.request.UpdateRequest;
 import org.apache.solr.common.SolrInputDocument;
-import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.ModifiableSolrParams;
 import org.apache.solr.common.util.ExecutorUtil;
-import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SolrNamedThreadFactory;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -67,67 +63,128 @@ public class HttpSolrClientConPoolTest extends SolrJettyTestBase {
       yetty = null;
     }
   }
-
-  public class SlowLbClient extends LBHttp2SolrClient {
-
-      private int i = 0;
-
-      public SlowLbClient(Http2SolrClient httpClient, boolean enableSpeculativeRetry, ExecutorService executorService, String... baseSolrUrls) {
-          super(httpClient, enableSpeculativeRetry, executorService, baseSolrUrls);
-      }
-
-      @Override
-      protected Exception doRequest(String baseUrl, Req req, Rsp rsp, boolean isNonRetryable,
-                                    boolean isZombie) throws SolrServerException, IOException {
-          System.out.println("=========in do request===========" + i);
-          if (i == 0) {
-              i+=1;
-              try {
-                  Thread.sleep(2000);
-              } catch (InterruptedException e) {
-                  throw new RuntimeException(e);
-              }
-              throw new SolrServerException("Expected Exception");
-          }
-          return super.doRequest(baseUrl, req, rsp, isNonRetryable, isZombie);
-      }
-  }
-
-  public void testLBClient() throws IOException, SolrServerException {
-     int threadCount = atLeast(2);
-      final ExecutorService threads = ExecutorUtil.newMDCAwareFixedThreadPool(threadCount,
-              new SolrNamedThreadFactory(getClass().getSimpleName()+"TestScheduler"));
-
-      Http2SolrClient http2SolrClient = new Http2SolrClient.Builder().connectionTimeout(1000).idleTimeout(2000).build();
-      final String[] url = new String[2];
-      url[0] = fooUrl;
-      url[1] = barUrl;
-
-      SlowLbClient roundRobin = null;
-      System.out.println("Foo:" + fooUrl + ", bar: " + barUrl);
-      try{
-        roundRobin = new SlowLbClient(http2SolrClient, true, threads, url);
-        roundRobin.deleteByQuery("*:*");
-        roundRobin.commit();
-
-        for (int i=0; i<10; i++) {
-          final SolrInputDocument doc = new SolrInputDocument("id", ""+i);
-          roundRobin.add(doc);
+  
+  public void testPoolSize() throws SolrServerException, IOException {
+    PoolingHttpClientConnectionManager pool = HttpClientUtil.createPoolingConnectionManager();
+    final HttpSolrClient client1 ;
+    final String fooUrl;
+    {
+      fooUrl = jetty.getBaseUrl().toString() + "/" + "collection1";
+      CloseableHttpClient httpClient = HttpClientUtil.createClient(new ModifiableSolrParams(), pool,
+            false /* let client shutdown it*/);
+      client1 = getHttpSolrClient(fooUrl, httpClient, DEFAULT_CONNECTION_TIMEOUT);
+    }
+    final String barUrl = yetty.getBaseUrl().toString() + "/" + "collection1";
+    
+    {
+      client1.setBaseURL(fooUrl);
+      client1.deleteByQuery("*:*");
+      client1.setBaseURL(barUrl);
+      client1.deleteByQuery("*:*");
+    }
+    
+    List<String> urls = new ArrayList<>();
+    for(int i=0; i<17; i++) {
+      urls.add(fooUrl);
+    }
+    for(int i=0; i<31; i++) {
+      urls.add(barUrl);
+    }
+    
+    Collections.shuffle(urls, random());
+    
+    try {
+      int i=0;
+      for (String url : urls) {
+        if (!client1.getBaseURL().equals(url)) {
+          client1.setBaseURL(url);
         }
-        roundRobin.commit();
-
-        ModifiableSolrParams params = new ModifiableSolrParams();
-        params.set("q", "*:*");
-        final LBSolrClient.Req req = new LBSolrClient.Req(new QueryRequest(params), Arrays.asList(url));
-        NamedList<Object> result = roundRobin.request(req).getResponse();
-        result.forEach(res -> {
-          System.out.println("NcRes: " + res.getKey() + ", Value: " + res.getValue());
-        });
-      } finally {
-        http2SolrClient.close();
-        roundRobin.close();
-        threads.shutdownNow();
+        client1.add(new SolrInputDocument("id", ""+(i++)));
+      }
+      client1.setBaseURL(fooUrl);
+      client1.commit();
+      assertEquals(17, client1.query(new SolrQuery("*:*")).getResults().getNumFound());
+      
+      client1.setBaseURL(barUrl);
+      client1.commit();
+      assertEquals(31, client1.query(new SolrQuery("*:*")).getResults().getNumFound());
+      
+      PoolStats stats = pool.getTotalStats();
+      assertEquals("oh "+stats, 2, stats.getAvailable());
+    } finally {
+      for (HttpSolrClient c : new HttpSolrClient []{ client1}) {
+        HttpClientUtil.close(c.getHttpClient());
+        c.close();
       }
     }
+  }
+  
 
+  public void testLBClient() throws IOException, SolrServerException {
+    
+    PoolingHttpClientConnectionManager pool = HttpClientUtil.createPoolingConnectionManager();
+    final HttpSolrClient client1 ;
+    int threadCount = atLeast(2);
+    final ExecutorService threads = ExecutorUtil.newMDCAwareFixedThreadPool(threadCount,
+        new SolrNamedThreadFactory(getClass().getSimpleName()+"TestScheduler"));
+    CloseableHttpClient httpClient = HttpClientUtil.createClient(new ModifiableSolrParams(), pool);
+    try{
+      final LBHttpSolrClient roundRobin = new LBHttpSolrClient.Builder().
+                withBaseSolrUrl(fooUrl).
+                withBaseSolrUrl(barUrl).
+                withHttpClient(httpClient)
+                .build();
+      
+      List<ConcurrentUpdateSolrClient> concurrentClients = Arrays.asList(
+          new ConcurrentUpdateSolrClient.Builder(fooUrl)
+          .withHttpClient(httpClient).withThreadCount(threadCount)
+          .withQueueSize(10)
+         .withExecutorService(threads).build(),
+           new ConcurrentUpdateSolrClient.Builder(barUrl)
+          .withHttpClient(httpClient).withThreadCount(threadCount)
+          .withQueueSize(10)
+         .withExecutorService(threads).build()); 
+      
+      for (int i=0; i<2; i++) {
+        roundRobin.deleteByQuery("*:*");
+      }
+      
+      for (int i=0; i<57; i++) {
+        final SolrInputDocument doc = new SolrInputDocument("id", ""+i);
+        if (random().nextBoolean()) {
+          final ConcurrentUpdateSolrClient concurrentClient = concurrentClients.get(random().nextInt(concurrentClients.size()));
+          concurrentClient.add(doc); // here we are testing that CUSC and plain clients reuse pool 
+          concurrentClient.blockUntilFinished();
+        } else {
+          if (random().nextBoolean()) {
+            roundRobin.add(doc);
+          } else {
+            final UpdateRequest updateRequest = new UpdateRequest();
+            updateRequest.add(doc); // here we mimic CloudSolrClient impl
+            final List<String> urls = Arrays.asList(fooUrl, barUrl);
+            Collections.shuffle(urls, random());
+            LBHttpSolrClient.Req req = new LBHttpSolrClient.Req(updateRequest, 
+                    urls);
+             roundRobin.request(req);
+          }
+        }
+      }
+      
+      for (int i=0; i<2; i++) {
+        roundRobin.commit();
+      }
+      int total=0;
+      for (int i=0; i<2; i++) {
+        total += roundRobin.query(new SolrQuery("*:*")).getResults().getNumFound();
+      }
+      assertEquals(57, total);
+      PoolStats stats = pool.getTotalStats();
+      //System.out.println("\n"+stats);
+      assertEquals("expected number of connections shouldn't exceed number of endpoints" + stats, 
+          2, stats.getAvailable());
+    }finally {
+      threads.shutdown();
+      HttpClientUtil.close(httpClient);
+    }
+  }
 }
