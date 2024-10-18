@@ -41,7 +41,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.solr.client.solrj.ResponseParser;
 import org.apache.solr.client.solrj.SolrClient;
@@ -281,7 +283,6 @@ public abstract class LBSolrClient extends SolrClient {
   public Rsp request(Req req) throws SolrServerException, IOException {
     Rsp rsp = new Rsp();
     Exception ex = null;
-    log.info("Request========");
     boolean isNonRetryable = req.request instanceof IsUpdateRequest || ADMIN_PATHS.contains(req.request.getPath());
     final List<ServerWrapper> skipped = new ArrayList<>();
     final List<String> goodServers = new ArrayList<>();
@@ -376,47 +377,54 @@ public abstract class LBSolrClient extends SolrClient {
     @Override
     public Exception execute(Req req, Rsp rsp, boolean isNonRetryable, boolean isZombie, List<String> servers, int index, AtomicInteger serversTried) throws SolrServerException, IOException {
       final long startTimeInMs = System.currentTimeMillis();
-      final long timeAllowedMs = req.getRequest().getParams() == null? defExecutionTimeSpecRetryInMs: req.getRequest().getParams().getLong(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
+      final long timeAllowedMs = req.getRequest().getParams() == null ? defExecutionTimeSpecRetryInMs : req.getRequest().getParams().getLong(CommonParams.TIME_ALLOWED, defExecutionTimeSpecRetryInMs);
       final Rsp rsp1 = new LBSolrClient.Rsp();
+
       if ((index + 1) < servers.size()) {
+        final AtomicReference<Exception> ex1ToBeRaised = new AtomicReference<>();
+        final AtomicReference<Exception> ex2ToBeRaised = new AtomicReference<>();
+
         CompletableFuture<Exception> future1 = CompletableFuture.supplyAsync((() -> {
           try {
-            log.info("===========Firing request on: {}", servers.get(index));
             serversTried.addAndGet(1);
             return doRequest(servers.get(index), req, rsp1, isNonRetryable, isZombie);
           } catch (SolrServerException | IOException e) {
-            return e;
+            ex1ToBeRaised.set(e);
           }
+          return null;
         }), executorService);
 
         final Rsp rsp2 = new LBSolrClient.Rsp();
         CompletableFuture<Exception> future2 = CompletableFuture.supplyAsync((() -> {
           try {
             Thread.sleep(timeAllowedMs / 2);
-            //This is an optimization to not fire 2 queries.
-            // TODO: In case of SolrServerException OR IOexception we should not try on another server. For simplicity, we are trying on another server and then exitting out of for loop in caller, but can return/break right here as an optimization
-            if (future1.isDone() && !future1.isCompletedExceptionally() && (future1.get() == null)) {
-              log.info("===========Slept for: {}ms, cancelling speculative firing on another server: {}", (timeAllowedMs / 2), servers.get(index + 1));
-              return future1.get();
+            // Firing SPEX only if exception not thrown till now from 1st thread
+            if (ex1ToBeRaised.get() == null) {
+              //This is an optimization to not fire 2 queries and only fire if result is not yet obtained.
+              if (!future1.isDone() || future1.isCompletedExceptionally()) {
+                //TODO: Add Metrics here for speculative execution
+                serversTried.addAndGet(1);
+                return doRequest(servers.get(index + 1), req, rsp2, isNonRetryable, isZombie);
+              }
             } else {
-              log.info("===========Slept for: {}ms before firing speculative request on: {}", (timeAllowedMs / 2), servers.get(index + 1));
-              serversTried.addAndGet(1);
-              return doRequest(servers.get(index + 1), req, rsp2, isNonRetryable, isZombie);
+              log.warn("Not firing SPEX on server: " + servers.get(index+1) + ", as exception is obtained from: " + servers.get(index), ex1ToBeRaised.get());
             }
-          } catch (InterruptedException | ExecutionException | SolrServerException | IOException e) {
-            return e;
+          } catch (SolrServerException | IOException | InterruptedException e) {
+            ex2ToBeRaised.set(e);
           }
+          return null;
         }), executorService);
 
         CompletableFuture<Object> combinedFuture = CompletableFuture.anyOf(future1, future2);
         try {
           Exception exAny = (Exception) combinedFuture.get(timeAllowedMs, TimeUnit.MILLISECONDS);
           if (future1.isDone()) {
-            return populateResponses(rsp, exAny, future1, rsp1, startTimeInMs, future2, rsp2);
+            return populateResponses(rsp, exAny, future1, rsp1, startTimeInMs, future2, rsp2, ex1ToBeRaised, ex2ToBeRaised);
           } else {
-            return populateResponses(rsp, exAny, future2, rsp2, startTimeInMs, future1, rsp1);
+            return populateResponses(rsp, exAny, future2, rsp2, startTimeInMs, future1, rsp1, ex2ToBeRaised, ex1ToBeRaised);
           }
         } catch (InterruptedException | TimeoutException | ExecutionException ex) {
+          // Returning ex will break the while loop for TimeoutException, Execution Exception is not possible as all exceptions are captured and converted to SolrServerException
           return ex;
         }
       } else {
@@ -426,25 +434,38 @@ public abstract class LBSolrClient extends SolrClient {
       }
     }
 
-    private Exception populateResponses(Rsp rsp, Exception exAny, CompletableFuture<Exception> future, Rsp rsp1, long startTimeInMs, CompletableFuture<Exception> secondFuture, Rsp rsp2) throws InterruptedException, ExecutionException, TimeoutException, IOException, SolrServerException {
-      if (exAny == null && !future.isCompletedExceptionally()) {
+    private Exception populateResponses(Rsp rsp, Exception exAny, CompletableFuture<Exception> completedFuture, Rsp rsp1, long startTimeInMs,
+                                        CompletableFuture<Exception> secondFuture, Rsp rsp2, AtomicReference<Exception> ex1ToBeRaised, AtomicReference<Exception> ex2ToBeRaised) throws InterruptedException, ExecutionException, TimeoutException, IOException, SolrServerException {
+      if (!completedFuture.isCompletedExceptionally() && exAny == null) {
+        //This breaks the complete loop
+        if (ex1ToBeRaised.get() != null) {
+          Exception e = ex1ToBeRaised.get();
+          if (e instanceof SolrServerException) {
+            throw (SolrServerException) e;
+          }
+
+          if (e instanceof IOException) {
+            throw (IOException) e;
+          }
+        }
         log.info("===========Result is obtained from: {}", rsp1.server);
         rsp.rsp = rsp1.rsp;
         rsp.server = rsp1.server;
         return null;
       } else {
         final long timeRemainingInMs = System.currentTimeMillis() - startTimeInMs;
-        rsp.server = rsp2.server;
-        //TODO: Metrics here for speculative execution
         Exception ex2 = secondFuture.get(timeRemainingInMs, TimeUnit.MILLISECONDS);
-        if (ex2 == null) {
-          log.info("===========Result is obtained from speculative execution: {}", rsp2.server);
-          rsp.rsp = rsp2.rsp;
-        } else if (ex2 instanceof IOException) {
-          throw (IOException) ex2;
-        } else if (ex2 instanceof SolrServerException) {
-          throw (SolrServerException) ex2;
+        if (ex2ToBeRaised.get() != null) {
+          Exception e = ex2ToBeRaised.get();
+          if (e instanceof SolrServerException) {
+            throw (SolrServerException) e;
+          }
+
+          if (e instanceof IOException) {
+            throw (IOException) e;
+          }
         }
+        rsp.server = rsp2.server;
         return ex2;
       }
     }

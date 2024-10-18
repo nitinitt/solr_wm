@@ -18,6 +18,8 @@ package org.apache.solr.client.solrj.impl;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 
 import org.apache.solr.SolrJettyTestBase;
@@ -65,10 +67,12 @@ public class SpeculativeExecutionTest extends SolrJettyTestBase {
     }
 
     public class TestLbClient extends LBHttp2SolrClient {
-
-        public boolean throwExceptionAfterDelay = false;
+        public boolean enableDelay;
         public Rsp rsp;
         public int count = 0;
+        public Set<String> urlsToThrowRunTimeException = new HashSet<>();
+        public Set<String> urlsToThrowSolrServerException = new HashSet<>();
+
 
         public TestLbClient(Http2SolrClient httpClient, boolean enableSpeculativeRetry, ExecutorService executorService, String... baseSolrUrls) {
             super(httpClient, enableSpeculativeRetry, executorService, baseSolrUrls);
@@ -77,16 +81,27 @@ public class SpeculativeExecutionTest extends SolrJettyTestBase {
         @Override
         protected Exception doRequest(String baseUrl, Req req, Rsp rsp, boolean isNonRetryable,
                                       boolean isZombie) throws SolrServerException, IOException {
-            count+=1;
-            if (throwExceptionAfterDelay) {
-                throwExceptionAfterDelay = false;
+
+            count += 1;
+
+            if (urlsToThrowRunTimeException.contains(baseUrl)) {
+                throw new RuntimeException("Expected Exception");
+            }
+
+            if (urlsToThrowSolrServerException.contains(baseUrl)) {
+                System.out.println("==================");
+                throw new SolrServerException("Expected Exception");
+            }
+
+            if (enableDelay) {
                 try {
-                    Thread.sleep(2000);
+                    enableDelay = false;
+                    Thread.sleep(4000);
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
                 }
-                throw new SolrServerException("Expected Exception");
             }
+
             Exception ex = super.doRequest(baseUrl, req, rsp, isNonRetryable, isZombie);
             this.rsp = rsp;
             return ex;
@@ -115,7 +130,7 @@ public class SpeculativeExecutionTest extends SolrJettyTestBase {
         }
     }
 
-    public void testErrorScenarioSpeculativeExecution() throws IOException, SolrServerException {
+    public void testSlowReplicaSpexFired() throws IOException, SolrServerException {
         int threadCount = atLeast(2);
         final ExecutorService threads = ExecutorUtil.newMDCAwareFixedThreadPool(threadCount,
                 new SolrNamedThreadFactory(getClass().getSimpleName() + "TestScheduler"));
@@ -123,19 +138,82 @@ public class SpeculativeExecutionTest extends SolrJettyTestBase {
         final String[] url = new String[2];
         url[0] = fooUrl;
         url[1] = barUrl;
+        log.info("1st server: {}, 2nd server: {}", fooUrl, barUrl);
 
         try (Http2SolrClient http2SolrClient = new Http2SolrClient.Builder().build();
              TestLbClient lbClient = new TestLbClient(http2SolrClient, true, threads, url)) {
             deleteDocs(lbClient);
             int testDocCount = 50;
-            lbClient.throwExceptionAfterDelay = true;
             insertDocs(lbClient, testDocCount);
+            lbClient.enableDelay = true;
             QueryResponse resp = queryDocs(lbClient, testDocCount, url);
+
             Assert.assertEquals("Result should be obtained from Spec Execution", barUrl, lbClient.rsp.server);
             Assert.assertEquals("Total docs retrieved should be: " + testDocCount/2, testDocCount/2, resp.getResults().size());
         } finally {
             threads.shutdownNow();
         }
+    }
+
+    /* 1st Replica is Slow
+       2nd Replica SPEX fired
+       2nd Replica errors out
+       Result returned from 1st Replica
+     */
+    public void testBothReplicasSlowSpexFired() throws IOException, SolrServerException {
+        int threadCount = atLeast(2);
+        final ExecutorService threads = ExecutorUtil.newMDCAwareFixedThreadPool(threadCount,
+                new SolrNamedThreadFactory(getClass().getSimpleName() + "TestScheduler"));
+
+        final String[] url = new String[2];
+        url[0] = fooUrl;
+        url[1] = barUrl;
+        log.info("1st server: {}, 2nd server: {}", fooUrl, barUrl);
+
+        try (Http2SolrClient http2SolrClient = new Http2SolrClient.Builder().build();
+             TestLbClient lbClient = new TestLbClient(http2SolrClient, true, threads, url)) {
+            deleteDocs(lbClient);
+            int testDocCount = 50;
+            insertDocs(lbClient, testDocCount);
+            lbClient.enableDelay = true;
+            lbClient.urlsToThrowRunTimeException.add(barUrl);
+            QueryResponse resp = queryDocs(lbClient, testDocCount, url);
+
+            Assert.assertEquals("Result should be obtained from Spec Execution", fooUrl, lbClient.rsp.server);
+            Assert.assertEquals("Total docs retrieved should be: " + testDocCount/2, testDocCount/2, resp.getResults().size());
+        } finally {
+            threads.shutdownNow();
+        }
+    }
+
+    public void testSpexNotFiredWhenFirstSolrServerThrowsException() throws IOException {
+        int threadCount = atLeast(2);
+        final ExecutorService threads = ExecutorUtil.newMDCAwareFixedThreadPool(threadCount,
+                new SolrNamedThreadFactory(getClass().getSimpleName() + "TestScheduler"));
+
+        final String[] url = new String[2];
+        url[0] = fooUrl;
+        url[1] = barUrl;
+        log.info("1st server: {}, 2nd server: {}", fooUrl, barUrl);
+
+        try (Http2SolrClient http2SolrClient = new Http2SolrClient.Builder().build();
+             TestLbClient lbClient = new TestLbClient(http2SolrClient, true, threads, url)) {
+            deleteDocs(lbClient);
+            int testDocCount = 50;
+            insertDocs(lbClient, testDocCount);
+            lbClient.urlsToThrowSolrServerException.add(fooUrl);
+            ModifiableSolrParams params = new ModifiableSolrParams();
+            params.set("q", "*:*");
+            params.set(CommonParams.ROWS, testDocCount);
+
+            final LBSolrClient.Req req = new LBSolrClient.Req(new QueryRequest(params), Arrays.asList(url));
+            NamedList<Object> result = lbClient.request(req).getResponse();
+        } catch (SolrServerException ex) {
+            return;
+        } finally {
+            threads.shutdownNow();
+        }
+        Assert.fail("Exception is expected");
     }
 
     private QueryResponse queryDocs(TestLbClient lbClient, int testDocCount, String... url) throws SolrServerException, IOException {
